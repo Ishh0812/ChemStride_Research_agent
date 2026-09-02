@@ -79,7 +79,7 @@ export default function App() {
           <span className="brand-mark">
             <SparklesIcon />
           </span>
-          <span className="brand-name">Company Intel</span>
+          <span className="brand-name">ChemStride</span>
           <span className="brand-tag">Beta</span>
         </div>
         <button

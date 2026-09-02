@@ -1,4 +1,4 @@
-"""
+Company Intel"""
 FastAPI backend for the company research tool.
 
 This file only adds an HTTP layer. All research/extraction logic lives
@@ -33,10 +33,11 @@ app = FastAPI(title="Company Research API", version="1.0.0")
 # Vite's default dev server ports. Add your deployed frontend origin here too.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ],
+   allow_origins=[
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "https://chem-stride-research-agent.vercel.app",
+]
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
