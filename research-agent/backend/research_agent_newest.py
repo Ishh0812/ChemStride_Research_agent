@@ -17,6 +17,7 @@ import re
 import json
 import time
 import hashlib
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urljoin
 
 from dotenv import load_dotenv
@@ -24,13 +25,15 @@ from serpapi import GoogleSearch
 import requests
 from bs4 import BeautifulSoup
 
+import china_sources
+
 load_dotenv()
 
 SERPAPI_KEY = os.getenv("SERPAPI_API_KEY")
 
 CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".research_cache.json")
 CACHE_TTL_DAYS = 14
-CACHE_VERSION = 5  # bumped: stricter LinkedIn employer validation + human-style queries
+CACHE_VERSION = 6  # bumped: adds evidence/research_log + China geo-block handling
 
 # Optional dependencies. Everything degrades gracefully if they are missing.
 try:
@@ -398,6 +401,21 @@ def empty_result(company_name, country):
             "people": [],
             "note": None,
         },
+        # Additive: per-field source attribution. The flat fields above keep
+        # their existing shape so nothing downstream (frontend included) has
+        # to change; this block says WHERE each value came from.
+        "evidence": {
+            "company_name": company_name,
+            "website": None,
+            "phone": [],
+            "email": [],
+            "address": {"original": None, "english": None, "source": None},
+            "legal_representative": None,
+            "main_business": None,
+            "key_personnel": [],
+            "blocked_sources": {},
+        },
+        "research_log": None,
     }
 
 
@@ -1000,7 +1018,10 @@ def extract_location(text, profile, country):
             candidates = []
             for hit in zh_hits:
                 cleaned = re.sub(r"^(联系地址|公司地址|注册地址|办公地址|办公地点|总部地址|总部|厂址|地址|地\s*址)\s*[:：]?\s*", "", hit).strip(" \t,，。;；")
-                if has_cjk(cleaned) and len(cleaned) >= 6:
+                # Profile pages run the address straight into the next section
+                # ("...22号查看地图 经营范围：..."); keep only the address part.
+                cleaned = china_sources.trim_cn_address(cleaned)
+                if cleaned and has_cjk(cleaned) and len(cleaned) >= 6:
                     score = (30 if any(k in hit for k in ("联系地址","公司地址","注册地址","办公地址","总部地址")) else 0)
                     score += (20 if any(k in cleaned for k in ("省","市","区","路","街","号","大厦","园区")) else 0)
                     candidates.append((score, cleaned))
@@ -1192,16 +1213,78 @@ def parse_page_content(html, url):
     return "\n".join(collected_text), collected_blocks
 
 
-def fetch_url_data(url, profile, timeout=8):
+def fetch_url_data(url, profile, timeout=8, return_html=False):
+    """Fetch one page, or give up fast.
+
+    Every page fetch in the agent funnels through here, so this is where a
+    geo/access wall is detected once and the host is then skipped for the rest
+    of the run - Tianyancha in particular must never be retried, and its block
+    page must never reach the extractors as if it were company data.
+
+    return_html additionally hands back the raw markup so callers that need to
+    walk links do not have to fetch the same page a second time.
+    """
+    empty = ("", [], "") if return_html else ("", [])
+
+    if china_sources.is_blocked(url):
+        return empty
+
+    # This host already proved it drops :443 - do not pay the TLS timeout again.
+    if url.lower().startswith("https://") and china_sources.prefers_http(url):
+        url = "http://" + url[len("https://"):]
+
     try:
-        response = requests.get(url, headers=build_headers(profile), timeout=timeout)
-        if response.status_code == 200:
-            if not response.encoding or response.encoding.lower() == "iso-8859-1":
-                response.encoding = response.apparent_encoding
-            return parse_page_content(response.text, url)
+        # (connect, read) - a hung read must not stall the whole research run.
+        response = requests.get(url, headers=build_headers(profile),
+                                timeout=(5, timeout))
+        if response.status_code != 200:
+            # 404/410 means THIS path is missing, not that the host is closed
+            # to us - the contact-page crawler guesses paths like /contact and
+            # must not blocklist the company's own domain when one 404s.
+            # Anything else (403, 419 anti-bot, 429, 5xx...) means retrying
+            # this host during this run is wasted time.
+            if response.status_code not in (404, 410):
+                china_sources.mark_blocked(url, f"http_{response.status_code}")
+            return empty
+
+        if not response.encoding or response.encoding.lower() == "iso-8859-1":
+            response.encoding = response.apparent_encoding
+
+        html = response.text
+        text, blocks = parse_page_content(html, url)
+
+        if china_sources.detect_geo_block(text, url) or china_sources.detect_geo_block(html, url):
+            china_sources.mark_blocked(url, "geo_blocked")
+            print(f"   ⛔ {china_sources.host_of(url)} served an access wall - skipping this host")
+            return empty
+
+        return (text, blocks, html) if return_html else (text, blocks)
     except requests.RequestException:
-        pass
-    return "", []
+        # Some mainland-hosted sites accept :80 but drop :443 from outside
+        # China (sinopec.com does exactly this), so an HTTPS connection
+        # failure is not proof the site is unreachable. Retry once over
+        # plain HTTP before writing the host off - this recovers the
+        # company's OWN site, which is the most trustworthy source there is.
+        if url.lower().startswith("https://"):
+            downgraded = "http://" + url[len("https://"):]
+            try:
+                response = requests.get(downgraded, headers=build_headers(profile),
+                                        timeout=(8, max(timeout, 15)))
+                if response.status_code == 200:
+                    if not response.encoding or response.encoding.lower() == "iso-8859-1":
+                        response.encoding = response.apparent_encoding
+                    html = response.text
+                    text, blocks = parse_page_content(html, url)
+                    if not china_sources.detect_geo_block(text, url):
+                        china_sources.mark_http_only(url)
+                        print(f"   ↩ {china_sources.host_of(url)} reachable over http (https blocked)")
+                        return (text, blocks, html) if return_html else (text, blocks)
+            except requests.RequestException:
+                pass
+        # Only after repeated failures - a single transient error on one page
+        # must not disqualify the company's own website.
+        china_sources.note_failure(url, "unreachable")
+    return empty
 
 
 # ==========================================
@@ -1479,25 +1562,96 @@ def search_web(company_name, country, industry_hint=None, num=8):
     )
 
 
+LINK_HINTS = ("联系", "地址", "电话", "contact", "about", "公司简介", "联系方式", "lianxi", "lxwm")
+
+
 def search_official_contact_pages(official_url, profile, country):
-    data={"text":"","blocks":[],"sources":[]}; visited=set(); queue=[official_url]
-    for path in (CONTACT_PATHS_ZH if country == "CN" else CONTACT_PATHS_EN): queue.append(urljoin(official_url+"/",path))
-    while queue and len(visited)<8:
-        target=queue.pop(0).rstrip("/")
-        if not target or target in visited: continue
-        if source_domain(target) != source_domain(official_url): continue
-        visited.add(target)
-        page_text,page_blocks=fetch_url_data(target,profile,timeout=12)
-        if not page_text: continue
-        data["text"] += "\n"+page_text; data["blocks"].extend(page_blocks); data["sources"].append(target)
+    """Crawl the company's own site for contact pages.
+
+    Pages are fetched in small parallel batches: a mainland-hosted page can
+    take ~10s to answer from outside China, and eight of those in sequence is
+    over a minute of pure waiting. Concurrency is capped low and stays within
+    one domain, so this is gentler than a burst of parallel requests across
+    many hosts. Ordering of results is preserved to keep extraction stable.
+    """
+    data = {"text": "", "blocks": [], "sources": []}
+    visited = set()
+
+    # Probe the homepage on its own BEFORE fanning out. Firing the whole batch
+    # at once would send every URL to :443 simultaneously, so a host that only
+    # answers on :80 would rack up parallel timeouts and get blocklisted
+    # before the first success could record the downgrade.
+    root = official_url.rstrip("/")
+    visited.add(root)
+    root_text, root_blocks, root_html = fetch_url_data(root, profile, timeout=12, return_html=True)
+    if root_text:
+        data["text"] += "\n" + root_text
+        data["blocks"].extend(root_blocks)
+        data["sources"].append(root)
+
+    frontier = []
+    for path in (CONTACT_PATHS_ZH if country == "CN" else CONTACT_PATHS_EN):
+        frontier.append(urljoin(official_url + "/", path))
+
+    def eligible(candidate):
+        candidate = (candidate or "").rstrip("/")
+        return (candidate and candidate not in visited
+                and source_domain(candidate) == source_domain(official_url)
+                and not china_sources.is_blocked(candidate))
+
+    # The homepage's own "contact us" link is usually the real contact page,
+    # and beats the guessed paths.
+    if root_html:
         try:
-            response=requests.get(target,headers=build_headers(profile),timeout=12); soup=BeautifulSoup(response.text,"html.parser")
-            for a in soup.find_all("a",href=True):
-                href=urljoin(target,a.get("href","").strip())
-                if source_domain(href) != source_domain(official_url): continue
-                low=(a.get_text(" ",strip=True)+" "+href).lower()
-                if any(x in low for x in ("联系","地址","电话","contact","about","公司简介","联系方式","lianxi","lxwm")) and href not in visited: queue.append(href)
-        except requests.RequestException: pass
+            for a in BeautifulSoup(root_html, "html.parser").find_all("a", href=True):
+                href = urljoin(root, a.get("href", "").strip())
+                low = (a.get_text(" ", strip=True) + " " + href).lower()
+                if any(x in low for x in LINK_HINTS) and eligible(href):
+                    frontier.insert(0, href)
+        except Exception:
+            pass
+
+    # Two waves: the guessed contact paths, then anything they linked to.
+    for _wave in range(2):
+        batch, seen_in_batch = [], set()
+        for candidate in frontier:
+            candidate = (candidate or "").rstrip("/")
+            if eligible(candidate) and candidate not in seen_in_batch:
+                batch.append(candidate)
+                seen_in_batch.add(candidate)
+            if len(visited) + len(batch) >= 8:
+                break
+        if not batch:
+            break
+        visited.update(batch)
+
+        # One request per page - this used to fetch each page a SECOND time
+        # just to walk its links.
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            fetched = list(pool.map(
+                lambda t: (t,) + fetch_url_data(t, profile, timeout=12, return_html=True),
+                batch,
+            ))
+
+        frontier = []
+        for target, page_text, page_blocks, html in fetched:
+            if not page_text:
+                continue
+            data["text"] += "\n" + page_text
+            data["blocks"].extend(page_blocks)
+            data["sources"].append(target)
+            if not html:
+                continue
+            # Only follow links that look like they lead to contact details.
+            try:
+                soup = BeautifulSoup(html, "html.parser")
+            except Exception:
+                continue
+            for a in soup.find_all("a", href=True):
+                href = urljoin(target, a.get("href", "").strip())
+                low = (a.get_text(" ", strip=True) + " " + href).lower()
+                if any(x in low for x in LINK_HINTS) and eligible(href):
+                    frontier.append(href)
     return data
 
 
@@ -1542,6 +1696,164 @@ def search_country_portals(company_name, country, industry_hint=None):
             portal_data["blocks"].extend(page_blocks)
 
     return portal_data
+
+
+def search_cn_free_sources(company_name, country, profile, log, official_domain=""):
+    """Free/accessible Chinese fallback sources, in order of trustworthiness.
+
+    Used only when the official site did not already yield contact details.
+    Every source is reached through the existing SerpAPI web search - no
+    Tianyancha API, no credentials, nothing paid. Results from hosts that
+    already served a wall this run are skipped without a second request.
+    """
+    data = {"text": "", "blocks": [], "sources": []}
+
+    for kind, template in china_sources.CN_FALLBACK_QUERIES:
+        results = serp_search(
+            {
+                "engine": "google",
+                "q": template.format(name=company_name),
+                "num": 8,
+                "gl": profile["gl"],
+                "hl": profile["hl"],
+                "google_domain": profile["google_domain"],
+            },
+            f"cn fallback [{kind}]",
+        )
+
+        kept = 0
+        for item in results:
+            link = (item.get("link") or "").strip()
+            title, snippet = item.get("title", ""), item.get("snippet", "")
+            if not link or china_sources.is_blocked(link):
+                continue
+            # Never let a news article be a contact-detail source.
+            if china_sources.is_news_source(link):
+                continue
+            if not result_mentions_company(company_name, link, title, snippet, country):
+                continue
+
+            # The snippet alone is often enough; only spend a page fetch when
+            # it looks like the full page carries contact details.
+            blob = f"{title} {snippet}"
+            data["text"] += f"\n\nSOURCE: {link}\n{blob}"
+            data["blocks"].extend([title, snippet])
+            data["sources"].append(link)
+            kept += 1
+
+            if any(k in blob for k in ("地址", "电话", "邮箱", "联系", "法定代表人")):
+                page_text, page_blocks = fetch_url_data(link, profile, timeout=8)
+                if page_text:
+                    data["text"] += "\n" + page_text
+                    data["blocks"].extend(page_blocks)
+
+            if kept >= 3:
+                break
+
+        if kept:
+            log.ok(f"Chinese company source searched ({kind})")
+        else:
+            log.fail(f"No usable results from {kind} sources")
+
+        # Stop as soon as we have something with contact-shaped content.
+        if any(k in data["text"] for k in ("地址", "电话", "邮箱")):
+            break
+
+    return data
+
+
+# Profile pages separate the label from the value with a colon, a period, or
+# nothing at all ("经营范围. 许可项目：..."), so the separator must be optional.
+CN_LEGAL_REP_RE = re.compile(r"(?:法定代表人|法人代表|法人)\s*[:：.\s]*\s*([一-鿿]{2,4})")
+CN_BUSINESS_RE = re.compile(r"(?:主营业务|经营范围|主营|许可项目|一般项目)\s*[:：.\s]*\s*([^\n]{4,160})")
+
+
+def build_evidence(result, corpus, profile, country):
+    """Attach per-field source attribution to an otherwise-unchanged result.
+
+    Reads only values the existing extractors already produced, then works out
+    which page each one came from - so this cannot change WHAT is reported,
+    only add provenance for it.
+    """
+    official_domain = source_domain(result.get("website") or "")
+    evidence = result["evidence"]
+    evidence["company_name"] = result.get("company")
+    evidence["website"] = result.get("website")
+
+    # --- phones: keep every valid distinct number, labelled where possible ---
+    phones = []
+    for raw in re.findall(r"\+?\d[\d\s\-().]{6,20}\d", corpus or ""):
+        normalised = normalize_phone(raw, profile)
+        if not normalised:
+            continue
+        source = china_sources.attribute(raw, corpus, official_domain)
+        # A number seen only in a news article is not company contact data.
+        if source and china_sources.is_news_source(source):
+            continue
+        phones.append({
+            "value": normalised,
+            "label": china_sources.label_phone(raw, corpus),
+            "source": source,
+        })
+    if result.get("phone") and not any(p["value"] == result["phone"] for p in phones):
+        phones.insert(0, {
+            "value": result["phone"],
+            "label": None,
+            "source": china_sources.attribute(result["phone"], corpus, official_domain),
+        })
+    evidence["phone"] = china_sources.dedupe_entries(phones)[:6]
+
+    # --- emails ---
+    emails = [c.strip(".,;:()[]<>") for c in EMAIL_RE.findall(corpus or "")]
+    emails = [c for c in emails if not any(bad in c.lower() for bad in BAD_EMAIL_HINTS)]
+    if result.get("email"):
+        emails.insert(0, result["email"])
+    seen_email = []
+    for value in emails:
+        source = china_sources.attribute(value, corpus, official_domain)
+        if source and china_sources.is_news_source(source):
+            continue
+        seen_email.append({"value": value, "source": source})
+    evidence["email"] = china_sources.dedupe_entries(seen_email)[:5]
+
+    # --- address: original Chinese + English translation, same values as the
+    # flat fields, just with a source attached ---
+    original = result.get("address_original")
+    english = result.get("address")
+    evidence["address"] = {
+        "original": original,
+        "english": english,
+        "source": china_sources.attribute(original or english, corpus, official_domain),
+    }
+
+    if country == "CN":
+        match = CN_LEGAL_REP_RE.search(corpus or "")
+        if match:
+            person = match.group(1)
+            evidence["legal_representative"] = {
+                "original": person,
+                "english": romanize_person(person),
+                "source": china_sources.attribute(person, corpus, official_domain),
+            }
+        match = CN_BUSINESS_RE.search(corpus or "")
+        if match:
+            business = _li_clean(match.group(1))
+            evidence["main_business"] = {
+                "original": business,
+                "english": translate_cn_snippet(business) if has_cjk(business) else business,
+                "source": china_sources.attribute(business, corpus, official_domain),
+            }
+
+    if result.get("contact_person"):
+        evidence["key_personnel"] = [{
+            "name": result["contact_person"],
+            "title": result.get("designation"),
+            "source": china_sources.attribute(
+                result["contact_person"].split(" (")[0], corpus, official_domain),
+        }]
+
+    evidence["blocked_sources"] = china_sources.blocked_report()
+    return evidence
 
 
 # ==========================================
@@ -1973,6 +2285,11 @@ def research_company(company_name, country=None, industry_hint=None, use_cache=T
     print(f"\n🔎 Researching: {company_name}  [{profile['name']} / +{profile['dial_code']}]")
     result = empty_result(company_name, country)
 
+    # Blocked hosts are remembered per run, so a wall is hit at most once.
+    china_sources.reset_blocked()
+    log = china_sources.ResearchLog(
+        "China Research" if country == "CN" else f"{profile['name']} Research")
+
     all_text = ""
     all_blocks = []
 
@@ -1981,9 +2298,12 @@ def research_company(company_name, country=None, industry_hint=None, use_cache=T
     web_results = search_web(company_name, country, industry_hint)
     official_url = pick_official_website(company_name, web_results, country)
 
+    log.ok("General web search")
+
     if official_url:
         result["website"] = official_url
         print(f"✅ Official website: {official_url}")
+        log.ok(f"Official website found ({source_domain(official_url)})")
 
         site_data = search_official_contact_pages(result["website"], profile, country)
         all_text += "\n" + site_data["text"]
@@ -2009,6 +2329,7 @@ def research_company(company_name, country=None, industry_hint=None, use_cache=T
                     result["sources"].append(link)
     else:
         print("⚠️ No official website matched this country. Using search snippets.")
+        log.fail("No official website could be verified")
         for item in web_results:
             link = item.get("link", "")
             title, snippet = item.get("title", ""), item.get("snippet", "")
@@ -2036,6 +2357,28 @@ def research_company(company_name, country=None, industry_hint=None, use_cache=T
         result["sources"].extend(portal_data["sources"])
     else:
         print("⏭️  Step 2 skipped - website already yielded email + phone (1 unit saved)")
+
+    # --- 2b. China-only free fallback sources ----------------------------
+    # Runs only when the official site and portals left us without contact
+    # details - so a company whose own site already answered costs nothing
+    # extra here.
+    if country == "CN":
+        for host, reason in china_sources.blocked_report().items():
+            if reason == "geo_blocked":
+                log.fail(f"{host} blocked by geographic restriction")
+            else:
+                log.fail(f"{host} unavailable ({reason})")
+
+        has_contact = bool(re.search(r"(地址|电话|邮箱|@)", all_text))
+        if not has_contact:
+            print("🇨🇳 Step 2b: free Chinese sources (registry / profiles / directories)")
+            cn_data = search_cn_free_sources(company_name, country, profile, log,
+                                             source_domain(result.get("website") or ""))
+            all_text += "\n" + cn_data["text"]
+            all_blocks.extend(cn_data["blocks"])
+            result["sources"].extend(cn_data["sources"])
+        else:
+            log.info("Contact details already found - free-source fallback skipped")
 
     # --- 3. Field extraction --------------------------------------------
     result["email"] = extract_official_email(all_text, result["website"], company_name, country)
@@ -2078,6 +2421,16 @@ def research_company(company_name, country=None, industry_hint=None, use_cache=T
         }
 
     result["sources"] = list(dict.fromkeys(result["sources"]))[:8]
+
+    # --- 4b. Source attribution + run log --------------------------------
+    log.ok("Address found") if result.get("address") else log.fail("No address found")
+    if result.get("address_original") and result.get("address"):
+        log.ok("Address translated")
+    log.ok("Phone found") if result.get("phone") else log.fail("No phone found")
+    log.ok("Email found") if result.get("email") else log.fail("No email found")
+
+    result["evidence"] = build_evidence(result, all_text, profile, country)
+    result["research_log"] = log.as_dict()
 
     # --- 5. LinkedIn people (country-driven role priority) ---------------
     # Runs last so it can reuse all_text - the pages already fetched from the
