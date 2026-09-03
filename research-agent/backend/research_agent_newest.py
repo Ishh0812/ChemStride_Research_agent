@@ -122,6 +122,12 @@ COUNTRY_PROFILES = {
         "phone_patterns": [r"1[3-9]\d{9}", r"(10|2[0-9])\d{8}", r"[3-9]\d{2}\d{7,8}"],
         "nsn_len": (10, 12),
         "tld_bonus": [".cn", ".com.cn", ".net.cn"],
+        # Searched in the order below, in small batches (see
+        # search_country_portals) - Google returns poor results when too many
+        # site: operators are OR'd into a single query. Batch 1 is the
+        # chemical/registry set that already worked; batches 2-3 are the
+        # export-facing B2B directories where Chinese suppliers publish
+        # contact details for overseas buyers.
         "portals": [
             "site:made-in-china.com",
             "site:chemicalbook.com",
@@ -131,11 +137,32 @@ COUNTRY_PROFILES = {
             "site:lookchem.com",
             "site:chemnet.com",
             "site:qcc.com",
+
+            "site:alibaba.com",
+            "site:globalsources.com",
+            "site:tradekey.com",
+            "site:go4worldbusiness.com",
+            "site:ec21.com",
+            "site:ecplaza.net",
+
+            "site:b2bmanufactures.com",
+            "site:etradeasia.com",
+            "site:tradeford.com",
+            "site:b2bmit.com",
+            "site:hisupplier.com",
+            "site:taiwantrade.com",
+            "site:buykorea.org",
+            "site:koreatradeworld.com",
+            "site:indotrade.com",
         ],
         "portal_hosts": [
             "made-in-china.com", "chemicalbook.com", "guidechem.com", "echemi.com",
             "molbase.com", "lookchem.com", "chemnet.com", "qcc.com", "1688.com",
             "hc360.com", "gongchang.com", "tianyancha.com",
+            "alibaba.com", "globalsources.com", "tradekey.com", "go4worldbusiness.com",
+            "ec21.com", "ecplaza.net", "b2bmanufactures.com", "etradeasia.com",
+            "tradeford.com", "b2bmit.com", "hisupplier.com", "taiwantrade.com",
+            "buykorea.org", "koreatradeworld.com", "indotrade.com",
         ],
         "messenger": "wechat",
         "cities": [
@@ -243,6 +270,11 @@ BLOCKED_WEBSITE_DOMAINS = {
     "nseindia.com", "bseindia.com", "pinterest.com", "tracxn.com",
     "crunchbase.com", "bloomberg.com", "wikipedia.org", "zoominfo.com",
     "dnb.com", "yellowpages.com", "glassdoor.com", "indeed.com",
+    # B2B directories: useful as DATA sources (see portal_hosts), but a
+    # supplier's storefront on one of them is never the company's own site.
+    "globalsources.com", "tradekey.com", "b2bmanufactures.com", "etradeasia.com",
+    "tradeford.com", "b2bmit.com", "ecplaza.net", "hisupplier.com",
+    "taiwantrade.com", "buykorea.org", "koreatradeworld.com", "indotrade.com",
 }
 
 LEGAL_SUFFIXES = {
@@ -250,6 +282,24 @@ LEGAL_SUFFIXES = {
     "pvt", "ltd", "llp", "inc", "enterprises", "group", "holdings", "co",
     "gmbh", "ag", "sa", "bv", "srl", "plc", "llc", "trading", "international",
     "technology", "technologies", "chemical", "chemicals",
+}
+
+# Words that say what a company DOES, not which company it IS. A domain that
+# matches only these is an industry portal or directory - asiamachinery.net
+# scored as the "official website" of "Zhengzhou Yufeng Heavy Machinery"
+# purely because "machinery" is a substring of it - so a distinctive token
+# (the actual name: "zhengzhou", "yufeng") has to match as well.
+GENERIC_INDUSTRY_WORDS = {
+    "machinery", "machine", "machines", "heavy", "industry", "industrial",
+    "equipment", "steel", "metal", "metals", "plastic", "plastics", "rubber",
+    "textile", "textiles", "packaging", "electric", "electrical", "electronic",
+    "electronics", "energy", "power", "solar", "pharma", "pharmaceutical",
+    "pharmaceuticals", "biotech", "medical", "food", "agro", "auto",
+    "automotive", "motor", "tools", "hardware", "import", "export", "imports",
+    "exports", "supply", "supplies", "supplier", "suppliers", "manufacture",
+    "manufacturing", "manufacturer", "manufacturers", "products", "product",
+    "material", "materials", "global", "asia", "asian", "china", "national",
+    "international", "worldwide", "trade", "trading",
 }
 
 GENERIC_NAMES = {
@@ -1411,7 +1461,13 @@ def score_website_candidate(company_name, url, title, snippet, country):
         tokens = [re.sub(r"[^a-z0-9]", "", t) for t in name_tokens(name)]
         if tokens:
             hits = sum(1 for t in tokens if t in flat_domain)
-            if hits: name_match_score += 80 + 15 * (hits - 1)
+            # A match on generic industry words alone means we found a
+            # directory, not this company's site. Require the distinctive
+            # part of the name to match too, when the name has one.
+            distinctive = [t for t in tokens if t not in GENERIC_INDUSTRY_WORDS]
+            distinctive_hits = sum(1 for t in distinctive if t in flat_domain)
+            if hits and (distinctive_hits or not distinctive):
+                name_match_score += 80 + 15 * (hits - 1)
         if country == "CN" and has_cjk(name):
             core = re.sub(r"(有限公司|股份有限公司|集团|公司)$", "", name.strip())
             if core and (core in (title or "") or core in (snippet or "")): name_match_score += 80
@@ -1655,8 +1711,11 @@ def search_official_contact_pages(official_url, profile, country):
     return data
 
 
+PORTAL_BATCH_SIZE = 8
+
+
 def search_country_portals(company_name, country, industry_hint=None):
-    """One portal query, restricted to that country's portal set."""
+    """Search that country's B2B portal set, in batches, cheapest-first."""
     profile = COUNTRY_PROFILES[country]
     portal_data = {"text": "", "blocks": [], "sources": []}
 
@@ -1664,36 +1723,60 @@ def search_country_portals(company_name, country, industry_hint=None):
         return portal_data
 
     hint = f" {industry_hint}" if industry_hint else ""
-    query = f'"{company_name}"{hint} ({" OR ".join(profile["portals"])})'
-    results = serp_search(
-        {
-            "engine": "google",
-            "q": query,
-            "num": 6,
-            "gl": profile["gl"],
-            "hl": profile["hl"],
-            "google_domain": profile["google_domain"],
-        },
-        f"portal search ({profile['name']})",
-    )
+    portals = profile["portals"]
+    # Google degrades badly once too many site: operators are OR'd together,
+    # so the portal set is searched in batches instead of one giant query.
+    # Batches run in priority order and stop as soon as a batch yields usable
+    # contact data, so the extra directories cost nothing on the common path.
+    batches = [portals[i:i + PORTAL_BATCH_SIZE] for i in range(0, len(portals), PORTAL_BATCH_SIZE)]
+    kept_total = 0
 
-    for item in results:
-        link = item.get("link", "")
-        if not any(host in link for host in profile["portal_hosts"]):
-            continue
+    for index, batch in enumerate(batches, start=1):
+        results = serp_search(
+            {
+                "engine": "google",
+                "q": f'"{company_name}"{hint} ({" OR ".join(batch)})',
+                "num": 8,
+                "gl": profile["gl"],
+                "hl": profile["hl"],
+                "google_domain": profile["google_domain"],
+            },
+            f"portal search ({profile['name']}) batch {index}/{len(batches)}",
+        )
 
-        title = item.get("title", "")
-        snippet = item.get("snippet", "")
-        if not result_mentions_company(company_name, link, title, snippet, country, industry_hint):
-            continue  # matched the portal query, but not evidently this company
-        portal_data["sources"].append(link)
-        portal_data["text"] += f"\nPORTAL_DATA ({link}):\n{title}\n{snippet}\n"
-        portal_data["blocks"].extend([title, snippet])
+        for item in results:
+            link = item.get("link", "")
+            if not any(host in link for host in profile["portal_hosts"]):
+                continue
+            if china_sources.is_blocked(link):
+                continue
 
-        page_text, page_blocks = fetch_url_data(link, profile, timeout=8)
-        if page_text:
-            portal_data["text"] += f"\n{page_text}\n"
-            portal_data["blocks"].extend(page_blocks)
+            title = item.get("title", "")
+            snippet = item.get("snippet", "")
+            if not result_mentions_company(company_name, link, title, snippet, country, industry_hint):
+                continue  # matched the portal query, but not evidently this company
+            if link in portal_data["sources"]:
+                continue
+
+            portal_data["sources"].append(link)
+            # Emit the same "SOURCE: <url>" marker parse_page_content() uses,
+            # so per-field attribution can credit portal-derived values
+            # instead of reporting source: null for them.
+            portal_data["text"] += f"\nSOURCE: {link}\nPORTAL_DATA:\n{title}\n{snippet}\n"
+            portal_data["blocks"].extend([title, snippet])
+            kept_total += 1
+
+            page_text, page_blocks = fetch_url_data(link, profile, timeout=8)
+            if page_text:
+                portal_data["text"] += f"\n{page_text}\n"
+                portal_data["blocks"].extend(page_blocks)
+
+        # Enough, and it already looks like contact data - stop paying for
+        # further batches.
+        if kept_total >= 3 and re.search(r"(地址|电话|邮箱|@|\+?\d{7,})", portal_data["text"]):
+            print(f"   ⏭️  portal batches {index + 1}-{len(batches)} skipped "
+                  f"({len(batches) - index} unit(s) saved)")
+            break
 
     return portal_data
 
@@ -1762,10 +1845,12 @@ def search_cn_free_sources(company_name, country, profile, log, official_domain=
     return data
 
 
-# Profile pages separate the label from the value with a colon, a period, or
-# nothing at all ("经营范围. 许可项目：..."), so the separator must be optional.
-CN_LEGAL_REP_RE = re.compile(r"(?:法定代表人|法人代表|法人)\s*[:：.\s]*\s*([一-鿿]{2,4})")
-CN_BUSINESS_RE = re.compile(r"(?:主营业务|经营范围|主营|许可项目|一般项目)\s*[:：.\s]*\s*([^\n]{4,160})")
+# A REAL separator is required. Making it optional let bare "法人" match
+# inside words like "法人资格的境外..." and walk off with the next few
+# characters ("资格的境"), which is not a name at all. "法人" alone is dropped
+# for the same reason - it is a substring of too many unrelated terms.
+CN_LEGAL_REP_RE = re.compile(r"(?:法定代表人|法人代表)\s*[:：]\s*([一-鿿]{2,4})")
+CN_BUSINESS_RE = re.compile(r"(?:主营业务|经营范围|许可项目|一般项目)\s*[:：]\s*([^\n]{4,160})")
 
 
 def build_evidence(result, corpus, profile, country):
@@ -1786,6 +1871,12 @@ def build_evidence(result, corpus, profile, country):
         normalised = normalize_phone(raw, profile)
         if not normalised:
             continue
+        # Product-listing pages yield digit runs that pass the country phone
+        # grammar but are page artifacts (IDs, price ranges). Five identical
+        # digits in a row is the giveaway; kept at five so real 400-hotline
+        # style numbers still get through.
+        if re.search(r"(\d)\1{4,}", normalised):
+            continue
         source = china_sources.attribute(raw, corpus, official_domain)
         # A number seen only in a news article is not company contact data.
         if source and china_sources.is_news_source(source):
@@ -1804,9 +1895,10 @@ def build_evidence(result, corpus, profile, country):
     evidence["phone"] = china_sources.dedupe_entries(phones)[:6]
 
     # --- emails ---
-    emails = [c.strip(".,;:()[]<>") for c in EMAIL_RE.findall(corpus or "")]
+    emails = [clean_email(c) for c in EMAIL_RE.findall(corpus or "")]
     emails = [c for c in emails if not any(bad in c.lower() for bad in BAD_EMAIL_HINTS)]
     if result.get("email"):
+        result["email"] = clean_email(result["email"])
         emails.insert(0, result["email"])
     seen_email = []
     for value in emails:
@@ -1826,31 +1918,44 @@ def build_evidence(result, corpus, profile, country):
         "source": china_sources.attribute(original or english, corpus, official_domain),
     }
 
+    def sourced(value, builder):
+        """Attach a source, but drop the field if it only came from a news
+        article - a registry fact quoted in a press piece is not provenance."""
+        if not value:
+            return None
+        src = china_sources.attribute(value, corpus, official_domain)
+        if src and china_sources.is_news_source(src):
+            return None
+        return builder(src)
+
     if country == "CN":
         match = CN_LEGAL_REP_RE.search(corpus or "")
-        if match:
-            person = match.group(1)
-            evidence["legal_representative"] = {
+        # Must also read as a plausible Chinese personal name, not just any
+        # 2-4 characters that happened to follow the label.
+        person = valid_cn_contact_person(match.group(1)) if match else None
+        if person:
+            evidence["legal_representative"] = sourced(person, lambda src: {
                 "original": person,
                 "english": romanize_person(person),
-                "source": china_sources.attribute(person, corpus, official_domain),
-            }
+                "source": src,
+            })
+
         match = CN_BUSINESS_RE.search(corpus or "")
-        if match:
-            business = _li_clean(match.group(1))
-            evidence["main_business"] = {
+        business = _li_clean(match.group(1)) if match else None
+        if business:
+            evidence["main_business"] = sourced(business, lambda src: {
                 "original": business,
                 "english": translate_cn_snippet(business) if has_cjk(business) else business,
-                "source": china_sources.attribute(business, corpus, official_domain),
-            }
+                "source": src,
+            })
 
     if result.get("contact_person"):
-        evidence["key_personnel"] = [{
+        bare = result["contact_person"].split(" (")[0]
+        evidence["key_personnel"] = [e for e in [sourced(bare, lambda src: {
             "name": result["contact_person"],
             "title": result.get("designation"),
-            "source": china_sources.attribute(
-                result["contact_person"].split(" (")[0], corpus, official_domain),
-        }]
+            "source": src,
+        })] if e]
 
     evidence["blocked_sources"] = china_sources.blocked_report()
     return evidence
@@ -1903,6 +2008,18 @@ LINKEDIN_ROLE_TIERS = {
 LINKEDIN_PROFILE_RE = re.compile(r"^https?://(?:[a-z0-9-]+\.)?linkedin\.com/in/[^/?#]+", re.I)
 LINKEDIN_COMPANY_RE = re.compile(r"^https?://(?:[a-z0-9-]+\.)?linkedin\.com/company/[^/?#]+", re.I)
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+
+# Scraped pages run the label straight into the value ("Emailsale@x.com",
+# "E-mail:info@x.com" stripped of punctuation), and the regex above happily
+# swallows the label. Only strip when something sensible remains.
+EMAIL_LABEL_PREFIX_RE = re.compile(r"^(?:e-?mail|mailto|mail|contact|tel|phone)(?=[a-z0-9._%+\-]{2,}@)", re.I)
+
+
+def clean_email(value):
+    if not value:
+        return value
+    cleaned = EMAIL_LABEL_PREFIX_RE.sub("", value.strip(".,;:()[]<>"))
+    return cleaned or value
 BAD_EMAIL_HINTS = ("example.com", "linkedin.com", "sentry.io", "noreply", "no-reply",
                    "domain.com", "email.com", "yourcompany")
 
@@ -2335,7 +2452,10 @@ def research_company(company_name, country=None, industry_hint=None, use_cache=T
             title, snippet = item.get("title", ""), item.get("snippet", "")
             if link and not result_mentions_company(company_name, link, title, snippet, country, industry_hint):
                 continue  # same-prefix homonym or unrelated result - don't let it in
-            all_text += f"\n{title}\n{snippet}\n"
+            # Tag with the source URL so anything extracted from this snippet
+            # can be attributed back to it, instead of reporting source: null.
+            all_text += (f"\nSOURCE: {link}\n{title}\n{snippet}\n" if link
+                         else f"\n{title}\n{snippet}\n")
             all_blocks.extend([title, snippet])
             if link and not is_blocked_domain(link):
                 result["sources"].append(link)
